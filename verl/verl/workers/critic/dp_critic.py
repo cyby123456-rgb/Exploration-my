@@ -35,6 +35,8 @@ from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import masked_mean
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_inputs
 from verl.workers.critic import BasePPOCritic
+from verl.utils.risk_functional import compute_rho_from_dist
+
 
 __all__ = ["DataParallelPPOCritic"]
 
@@ -215,6 +217,7 @@ class DataParallelPPOCritic(BasePPOCritic):
             micro_batches = batch.split(micro_batch_size)
 
         values_lst = []
+        taus_lst = []
         for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
@@ -228,27 +231,59 @@ class DataParallelPPOCritic(BasePPOCritic):
             for item in values_lst:
                 if isinstance(item, (tuple, list)):
                     quantiles.append(item[0]) # item(quan, taus) quan
+                    if item[1] is not None:
+                        taus_lst.append(item[1])
                 else:
                     quantiles.append(item)
             values = torch.concat(quantiles, dim=0)
+            if len(taus_lst) > 0:
+                taus = torch.concat(taus_lst, dim=0)
+            else:
+                taus = None
         else:
             values = torch.concat(values_lst, dim=0)
-        #values = torch.concat(values_lst, dim=0)
         responses = data.batch["responses"]
         attention_mask = data.batch["attention_mask"]
         response_length = responses.size(1)
         #values = values * attention_mask[:, -response_length - 1 : -1]
         response_mask = attention_mask[:, -response_length - 1 : -1]
         if self.is_distributional:
-            if self.quantile_mode == "c51":
-                atoms = torch.linspace(self.c51_v_min, self.c51_v_max, values.size(-1), device=values.device, dtype=values.dtype)
-                probs = torch.softmax(values, dim=-1)
-                expect = (probs * atoms.view(1, 1, -1)).sum(dim=-1)
-                values = expect * response_mask
-                values_mean = values
+            risk_apply_to = self.config.algorithm.get("risk_apply_to", "none")
+            risk_level = self.config.algorithm.get("risk_level", "neutral")
+            
+            # If standard mean based, existing path (or neutral)
+            # If risk active: compute rho(Z)
+            use_risk = (risk_apply_to in ["baseline", "target"]) and (risk_level != "neutral")
+            
+            if use_risk:
+                dist_type = "c51" if self.quantile_mode == "c51" else "quantile"
+                if dist_type == "c51":
+                    atoms = torch.linspace(self.c51_v_min, self.c51_v_max, values.size(-1), device=values.device, dtype=values.dtype)
+                    values = compute_rho_from_dist(dist_type="c51", vpreds_or_logits=values, taus_or_atoms=atoms, risk_level=risk_level)
+                    # values is now (Batch, T)
+                    values = values * response_mask
+                    values_mean = values
+                else:
+                    # IQN / Fixed
+                    # If IQN, we have taus (collected above).
+                    # If Fixed, taus is None, we need to generate fixed grid.
+                    if taus is None:
+                        k = values.size(-1)
+                        # (K,)
+                        taus = (torch.arange(k, device=values.device, dtype=values.dtype) + 0.5) / k
+                    values = compute_rho_from_dist(dist_type="quantile", vpreds_or_logits=values, taus_or_atoms=taus, risk_level=risk_level)
+                    values = values * response_mask
+                    values_mean = values
             else:
-                values = values * response_mask.unsqueeze(-1)
-                values_mean = values.mean(dim=-1)
+                if self.quantile_mode == "c51":
+                    atoms = torch.linspace(self.c51_v_min, self.c51_v_max, values.size(-1), device=values.device, dtype=values.dtype)
+                    probs = torch.softmax(values, dim=-1)
+                    expect = (probs * atoms.view(1, 1, -1)).sum(dim=-1)
+                    values = expect * response_mask
+                    values_mean = values
+                else:
+                    values = values * response_mask.unsqueeze(-1)
+                    values_mean = values.mean(dim=-1)
         else:
             values = values * response_mask
             values_mean = values

@@ -219,6 +219,8 @@ algorithm:
     kl_coef: 0.001
     horizon: 10000
     target_kl: 0.1
+  risk_apply_to: "none" # "none" | "baseline" | "target"
+  risk_level: "neutral" # "neutral" | "averse" | "seeking" | "cvar_lower_0.1" | "cvar_upper_0.1"
 
 trainer:
   balance_batch: True
