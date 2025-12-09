@@ -1,0 +1,170 @@
+#!/bin/bash
+set -x
+
+# Warning: Export VLLM_ATTENTION_BACKEND on every machine before starting Ray cluster.
+# vLLM without XFORMERS will results in CUDA errors.
+N_NODE=1
+EXPERIMENT_NAME=r1-distill-7b-stage1
+DATA=parquet/stage1/polaris-data-53K.parquet
+ENTROPY_MODE=token
+VAL_NOISE_STD=0.0
+VAL_NOISE_LAYER_IDX=null
+VAL_NOISE_ALL_LAYERS=false
+VAL_NOISE_DECAY_STEPS=null
+VAL_NOISE_DECAY_MIN_STD=0.0
+VAL_NOISE_LAYER_FRACTION=null
+VAL_NOISE_LAYER_SEED=0
+CRITIC_DISTRIBUTIONAL=true
+CRITIC_NUM_QUANTILES=32
+CRITIC_QUANTILE_KAPPA=1.0
+CRITIC_QUANTILE_MODE=iqn
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --model)
+            MODEL_PATH="$2"
+            shift 2
+            ;;
+        --data_path)
+            DATA="$2"
+            shift 2
+            ;;
+        --n_node)
+            N_NODE="$2"
+            shift 2
+            ;;
+        --experiment_name)
+            EXPERIMENT_NAME="$2"
+            shift 2
+            ;;
+        --val_noise_std)
+            VAL_NOISE_STD="$2"
+            shift 2
+            ;;
+        --val_noise_layer_idx)
+            VAL_NOISE_LAYER_IDX="$2"
+            shift 2
+            ;;
+        --entropy_mode)
+            ENTROPY_MODE="$2"
+            shift 2
+            ;;
+        --critic_distributional)
+            CRITIC_DISTRIBUTIONAL="$2"
+            shift 2
+            ;;
+        --critic_num_quantiles)
+            CRITIC_NUM_QUANTILES="$2"
+            shift 2
+            ;;
+        --critic_quantile_kappa)
+            CRITIC_QUANTILE_KAPPA="$2"
+            shift 2
+            ;;
+        --critic_quantile_mode)
+            CRITIC_QUANTILE_MODE="$2"
+            shift 2
+            ;;
+        --val_noise_all_layers)
+            VAL_NOISE_ALL_LAYERS="$2"
+            shift 2
+            ;;
+        --val_noise_decay_steps)
+            VAL_NOISE_DECAY_STEPS="$2"
+            shift 2
+            ;;
+        --val_noise_min_std)
+            VAL_NOISE_DECAY_MIN_STD="$2"
+            shift 2
+            ;;
+        --val_noise_layer_fraction)
+            VAL_NOISE_LAYER_FRACTION="$2"
+            shift 2
+            ;;
+        --val_noise_layer_seed)
+            VAL_NOISE_LAYER_SEED="$2"
+            shift 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+
+# Train over a single node, 8 H800-80GB GPUs.
+python3 -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=gae \
+    data.train_files=${DATA} \
+    data.val_files=evaluation/benchmarks/aime24.parquet \
+    data.train_batch_size=128 \
+    data.val_batch_size=512 \
+    data.max_prompt_length=1024 \
+    data.max_response_length=15360 \
+    actor_rollout_ref.model.path=$MODEL_PATH  \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=128 \
+    actor_rollout_ref.actor.use_dynamic_bsz=True \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.kl_loss_coef=0 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.clip_ratio_low=0.2 \
+    actor_rollout_ref.actor.clip_ratio_high=0.28 \
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.temperature=0.7 \
+    actor_rollout_ref.rollout.top_p=1.0 \
+    actor_rollout_ref.rollout.top_k=-1 \
+    actor_rollout_ref.rollout.enable_chunked_prefill=True \
+    actor_rollout_ref.rollout.n=1 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
+    actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
+    actor_rollout_ref.rollout.val_kwargs.n=8 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.entropy_mode=${ENTROPY_MODE} \
+    algorithm.kl_ctrl.kl_coef=0.001 \
+    trainer.critic_warmup=0 \
+    trainer.logger=['console','wandb'] \
+    trainer.project_name='Polaris-Reproduce-R1-distill-7B' \
+    trainer.experiment_name=$EXPERIMENT_NAME \
+    trainer.val_before_train=False \
+    trainer.n_gpus_per_node=8 \
+    trainer.nnodes=$N_NODE \
+    trainer.debug=False \
+    trainer.dyn_sampling_polaris=True \
+    trainer.save_freq=10 \
+    trainer.test_freq=50 \
+    trainer.validation_noise.std=${VAL_NOISE_STD} \
+    trainer.validation_noise.layer_idx=${VAL_NOISE_LAYER_IDX} \
+    trainer.validation_noise.all_layers=${VAL_NOISE_ALL_LAYERS} \
+    trainer.validation_noise.layer_fraction=${VAL_NOISE_LAYER_FRACTION} \
+    trainer.validation_noise.layer_seed=${VAL_NOISE_LAYER_SEED} \
+    trainer.validation_noise.decay.steps=${VAL_NOISE_DECAY_STEPS} \
+    trainer.validation_noise.decay.min_std=${VAL_NOISE_DECAY_MIN_STD} \
+    critic.distributional=${CRITIC_DISTRIBUTIONAL} \
+    critic.num_quantiles=${CRITIC_NUM_QUANTILES} \
+    critic.quantile_huber_kappa=${CRITIC_QUANTILE_KAPPA} \
+    critic.quantile_mode=${CRITIC_QUANTILE_MODE} \
+    trainer.default_hdfs_dir=null \
+    trainer.total_epochs=30 "${@:1}"
+
+
+
+# Echo the command for verification
+echo "Command to be executed:"
+echo "$CMD"
+
+# Execute the command
+eval "$CMD"
