@@ -599,9 +599,79 @@ def compute_quantile_value_loss(
     huber = torch.where(abs_diff <= kappa, 0.5 * diff.pow(2), kappa * (abs_diff - 0.5 * kappa))
     tau = taus.unsqueeze(-1)
     loss = (torch.abs(tau - (diff < 0).float()) * huber).mean(dim=-2)  # mean over target dim
-    # mask and average
-    loss_mask = response_mask.unsqueeze(-1)  # (bs, T, 1)
     loss = verl_F.masked_mean(loss, loss_mask)
+    return loss
+
+
+def compute_categorical_value_loss(
+    logits: torch.FloatTensor,
+    returns: torch.FloatTensor,
+    response_mask: torch.FloatTensor,
+    atoms: torch.FloatTensor,
+):
+    """
+    Compute the categorical value loss for C51.
+    Projects the scalar returns onto the fixed atoms (support) to create a target distribution,
+    then computes the Cross Entropy loss between the predicted logits and the target distribution.
+
+    Args:
+        logits: (bs, T, num_atoms) - predicted logits (unnormalized log-probs)
+        returns: (bs, T) - scalar target returns
+        response_mask: (bs, T) - mask for valid tokens
+        atoms: (num_atoms,) - fixed atom values (support)
+    """
+    # 1. Validation
+    bs, t, n_atoms = logits.shape
+    assert atoms.shape == (n_atoms,), f"atoms shape mismatch: expected ({n_atoms},), got {atoms.shape}"
+    
+    # 2. Project returns onto atoms
+    # returns: (bs, T) -> (bs, T, 1)
+    target_returns = returns.clamp(min=atoms.min().item(), max=atoms.max().item()).unsqueeze(-1)
+    
+    delta_z = atoms[1] - atoms[0]
+    
+    # bj: (bs, T, 1) - continuous index of the target return in the atom space
+    bj = (target_returns - atoms[0]) / delta_z
+    
+    # Calculate probabilities for lower and upper atoms (linear interpolation)
+    l = bj.floor().long()
+    u = l + 1
+    
+    prob_u = bj - l.float()
+    prob_l = 1.0 - prob_u
+    
+    # We need to scatter these probs into target_dist.
+    target_probs = torch.zeros(bs, t, n_atoms, device=logits.device, dtype=logits.dtype)
+    
+    # Flat view for simpler scatter
+
+    target_probs_flat = target_probs.view(-1, n_atoms) # (N, n_atoms) with N = bs*T
+    l_flat = l.view(-1, 1)     # (N, 1)
+    u_flat = u.view(-1, 1)     # (N, 1)
+    prob_l_flat = prob_l.view(-1, 1) 
+    prob_u_flat = prob_u.view(-1, 1)
+    
+    # scatter_add_
+    # We clip u_flat to n_atoms-1 to avoid index error? 
+    # If u == n_atoms, prob_u SHOULD be 0 because bj <= n_atoms-1 -> bj - floor(bj) ???
+    # If return = v_max, bj = n_atoms - 1. l = n_atoms - 1. u = n_atoms.
+    # prob_u = (n_atoms - 1) - (n_atoms - 1) = 0.
+    # So yes, u's contribution is 0. We can safely clamp u to be valid index for scatter, it won't add anything.
+    u_flat = u_flat.clamp(max=n_atoms - 1)
+    
+    target_probs_flat.scatter_add_(1, l_flat, prob_l_flat)
+    target_probs_flat.scatter_add_(1, u_flat, prob_u_flat)
+    
+    target_probs = target_probs_flat.view(bs, t, n_atoms)
+    
+    # 3. Compute Loss (KL / CrossEntropy)
+    # CE = - sum(p * log q)
+    log_probs = torch.log_softmax(logits, dim=-1)
+    loss_per_token = -torch.sum(target_probs * log_probs, dim=-1) # (bs, T)
+    
+    # 4. Mask and Average
+    loss = verl_F.masked_mean(loss_per_token, response_mask)
+    
     return loss
 
 

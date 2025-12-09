@@ -323,30 +323,50 @@ class DataParallelPPOCritic(BasePPOCritic):
                     #    cliprange_value=self.config.cliprange_value,
                     #)
                     if self.is_distributional:
-                        vpreds, taus = vpreds
-                        quantile_mask = response_mask.unsqueeze(-1).bool()
-                        flat_quantiles = torch.masked_select(vpreds.detach(), quantile_mask)
-                        if flat_quantiles.numel() > 0:
-                            append_to_dict(
-                                metrics,
-                                {
-                                    "critic/quantile_min": flat_quantiles.min().item(),
-                                    "critic/quantile_max": flat_quantiles.max().item(),
-                                    "critic/quantile_var": flat_quantiles.var(unbiased=False).item(),
-                                    "critic/quantile_std": flat_quantiles.std(unbiased=False).item(),
-                                },
+                        if self.quantile_mode == "c51":
+                            vpreds, _ = vpreds  # vpreds is logits, taus is None
+                            # Generate atoms for projection
+                            atoms = torch.linspace(
+                                self.c51_v_min, self.c51_v_max, self.num_quantiles,
+                                device=vpreds.device, dtype=vpreds.dtype
                             )
-                        vf_loss = core_algos.compute_quantile_value_loss(
-                            vpreds=vpreds,  # (bs, T, K)
-                            returns=returns,  # scalar targets
-                            response_mask=response_mask,
-                            num_quantiles=self.num_quantiles,
-                            tau_mode=self.quantile_mode,  # iqn or fixed
-                            kappa=self.quantile_huber_kappa,
-                            taus=taus,
-                        )
-                        vf_clipfrac = torch.tensor(0.0, device=vpreds.device)  # not used for dist. loss
-                        vpred_mean = masked_mean(vpreds.mean(dim=-1), response_mask).detach().item()  # mean of quantiles
+                            vf_loss = core_algos.compute_categorical_value_loss(
+                                logits=vpreds,
+                                returns=returns,
+                                response_mask=response_mask,
+                                atoms=atoms,
+                            )
+                            # For logging/metrics, compute expected value
+                            probs = torch.softmax(vpreds, dim=-1)
+                            expect = (probs * atoms.view(1, 1, -1)).sum(dim=-1)
+                            vpred_mean = masked_mean(expect, response_mask).detach().item()
+                            vf_clipfrac = torch.tensor(0.0, device=vpreds.device)
+                        else:
+                            # IQN or Fixed Quantile Regression
+                            vpreds, taus = vpreds
+                            quantile_mask = response_mask.unsqueeze(-1).bool()
+                            flat_quantiles = torch.masked_select(vpreds.detach(), quantile_mask)
+                            if flat_quantiles.numel() > 0:
+                                append_to_dict(
+                                    metrics,
+                                    {
+                                        "critic/quantile_min": flat_quantiles.min().item(),
+                                        "critic/quantile_max": flat_quantiles.max().item(),
+                                        "critic/quantile_var": flat_quantiles.var(unbiased=False).item(),
+                                        "critic/quantile_std": flat_quantiles.std(unbiased=False).item(),
+                                    },
+                                )
+                            vf_loss = core_algos.compute_quantile_value_loss(
+                                vpreds=vpreds,  # (bs, T, K)
+                                returns=returns,  # scalar targets
+                                response_mask=response_mask,
+                                num_quantiles=self.num_quantiles,
+                                tau_mode=self.quantile_mode,  # iqn or fixed
+                                kappa=self.quantile_huber_kappa,
+                                taus=taus,
+                            )
+                            vf_clipfrac = torch.tensor(0.0, device=vpreds.device)  # not used for dist. loss
+                            vpred_mean = masked_mean(vpreds.mean(dim=-1), response_mask).detach().item()  # mean of quantiles
                     else:
                         vpreds = vpreds.squeeze(-1)  # (bs, T)
                         vf_loss, vf_clipfrac = core_algos.compute_value_loss(
