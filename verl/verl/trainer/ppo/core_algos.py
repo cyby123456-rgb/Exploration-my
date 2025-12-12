@@ -696,7 +696,8 @@ def compute_categorical_value_loss(
     # If return = v_max, bj = n_atoms - 1. l = n_atoms - 1. u = n_atoms.
     # prob_u = (n_atoms - 1) - (n_atoms - 1) = 0.
     # So yes, u's contribution is 0. We can safely clamp u to be valid index for scatter, it won't add anything.
-    u_flat = u_flat.clamp(max=n_atoms - 1)#clip
+    u_flat = u_flat.clamp(min=0,max=n_atoms-1)#clip
+    l_flat = l_flat.clamp(min=0,max=n_atoms-1)
 
     target_probs_flat.scatter_add_(1, l_flat, prob_l_flat)
     target_probs_flat.scatter_add_(1, u_flat, prob_u_flat)
