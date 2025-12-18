@@ -189,57 +189,24 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, risk_apply_to="none"):
+def compute_advantage(
+    data: DataProto,
+    adv_estimator,
+    gamma=1.0,
+    lam=1.0,
+    num_repeat=1,
+    multi_turn=False,
+    norm_adv_by_std_in_grpo=True,
+    risk_apply_to="none",
+    risk_mix_weight=0.0,
+):
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch:
         data.batch["response_mask"] = compute_response_mask(data)
     # prepare response group
-    # TODO: add other ways to estimate advantages
-    if risk_apply_to == "target":
-        # Risk-sensitive target mode: optimize E[rho(Z)] directly.
-        # Critic returns rho(Z) in "values".
-        # We take rho(Z) at the last step (or aggregating) and define it as the return.
-        # Simplified version: returns = rho(Z_last) broadcasted.
-        rho = data.batch["values"]  # (B, T)
-        response_mask = data.batch["response_mask"]
-
-        # Take the value at the last valid token of response? 
-        # Actually values is already masked by response_mask in critic?
-        # In dp_critic: values = values * response_mask
-        # So invalid steps are 0.
-        # But we want the value at the *end* of the episode (or end of response).
-
-        # We can sum values / sum(mask) ? No, that's average risk over path.
-        # Usually risk is defined on the Return Z.
-        # Critic estimates rho(Z_t).
-        # rho(Z_0) is the risk of the whole trajectory.
-        # But PPO updates policy at all steps.
-        # Should we use rho(Z_t) as target for step t?
-        # "returns = rho_seq" in prompt implies using the risk value as the return.
-
-        # Prompt: "rho_seq = rho(Z(s_last)) ... returns = rho_seq.unsqueeze(-1)..."
-        # So we take the LAST value.
-
-        # rho is (B, T). We want (B,) from the last step.
-        # How to find last step efficiently? argmax over mask?
-        # Actually simplest is just take the last element if we know it corresponds to EOS?
-        # But padding...
-        # response_mask has 1s then 0s.
-        # Last valid index: response_mask.sum(1) - 1.
-
-        last_indices = response_mask.sum(1).long() - 1
-        last_indices = last_indices.clamp(min=0) # handle empty?
-
-        # gather
-        # rho: (B, T)
-        rho_last = rho.gather(1, last_indices.unsqueeze(1)).squeeze(1) # (B,)
-
-        returns = rho_last.unsqueeze(1).expand_as(response_mask) * response_mask
-        advantages = returns # REINFORCE-like with risk return
-
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
-        return data
+    values_for_adv = data.batch.get("values", None)
+    if risk_apply_to == "baseline" and "values_risk" in data.batch:
+        values_for_adv = data.batch["values_risk"]
 
     if adv_estimator == AdvantageEstimator.PASSKTRAINING:
         advantages, returns = core_algos.compute_passktraining_advantage(
@@ -253,7 +220,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
     elif adv_estimator == AdvantageEstimator.GAE:
         advantages, returns = core_algos.compute_gae_advantage_return(
             token_level_rewards=data.batch["token_level_rewards"],
-            values=data.batch["values"],
+            values=values_for_adv,
             response_mask=data.batch["response_mask"],
             gamma=gamma,
             lam=lam,
@@ -333,6 +300,24 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["returns"] = returns
     else:
         raise NotImplementedError
+
+    # risk-target mixing (only used when explicitly enabled)
+    if risk_apply_to == "target" and risk_mix_weight > 0:
+        response_mask = data.batch["response_mask"]
+        rho = data.batch.get("values_risk", data.batch.get("values", None))
+        if rho is not None:
+            last_indices = response_mask.sum(1).long() - 1
+            last_indices = last_indices.clamp(min=0)
+            rho_last = rho.gather(1, last_indices.unsqueeze(1)).squeeze(1)  # (B,)
+            risk_returns = rho_last.unsqueeze(1).expand_as(response_mask) * response_mask
+            risk_advantages = risk_returns
+
+            w = max(0.0, min(1.0, float(risk_mix_weight)))
+            base_returns = data.batch["returns"]
+            base_advantages = data.batch["advantages"]
+            mix_tensor = torch.tensor(w, device=base_returns.device, dtype=base_returns.dtype)
+            data.batch["returns"] = base_returns * (1 - mix_tensor) + risk_returns * mix_tensor
+            data.batch["advantages"] = base_advantages * (1 - mix_tensor) + risk_advantages * mix_tensor
     return data
 
 
@@ -1383,6 +1368,7 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                             risk_apply_to=self.config.algorithm.get("risk_apply_to", "none"),
+                            risk_mix_weight=self.config.algorithm.get("risk_mix_weight", 0.0),
                         ) # type: ignore
 
                     # update critic

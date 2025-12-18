@@ -247,55 +247,42 @@ class DataParallelPPOCritic(BasePPOCritic):
         response_length = responses.size(1)
         #values = values * attention_mask[:, -response_length - 1 : -1]
         response_mask = attention_mask[:, -response_length - 1 : -1]
+        values_risk = None
         if self.is_distributional:
             risk_apply_to = self.config.get("risk_apply_to", "none")
             risk_level = self.config.get("risk_level", "neutral")
+            dist_type = "c51" if self.quantile_mode == "c51" else "quantile"
 
-            # If standard mean based, existing path (or neutral)
-            # If risk active: compute rho(Z)
+            if self.quantile_mode == "c51":
+                atoms = torch.linspace(self.c51_v_min, self.c51_v_max, values.size(-1), device=values.device, dtype=values.dtype)
+                probs = torch.softmax(values, dim=-1)
+                expect = (probs * atoms.view(1, 1, -1)).sum(dim=-1)
+                values_mean = expect * response_mask
+            else:
+                values_mean = (values * response_mask.unsqueeze(-1)).mean(dim=-1)
+
             use_risk = (risk_apply_to in ["baseline", "target"]) and (risk_level != "neutral")
-
             if use_risk:
-                dist_type = "c51" if self.quantile_mode == "c51" else "quantile"
                 if dist_type == "c51":
-                    atoms = torch.linspace(self.c51_v_min, self.c51_v_max, values.size(-1), device=values.device, dtype=values.dtype)
-                    values = compute_rho_from_dist(dist_type="c51", vpreds_or_logits=values, taus_or_atoms=atoms, risk_level=risk_level)
-                    # values is now (Batch, T)
-                    values = values * response_mask
-                    values_mean = values
+                    values_risk = compute_rho_from_dist(dist_type="c51", vpreds_or_logits=values, taus_or_atoms=atoms, risk_level=risk_level)
                 else:
-                    # IQN / Fixed
-                    # If IQN, we have taus (collected above).
-                    # If Fixed, taus is None, we need to generate fixed grid.
                     if taus is None:
                         k = values.size(-1)
-                        # (K,)
                         taus = (torch.arange(k, device=values.device, dtype=values.dtype) + 0.5) / k
-                    values = compute_rho_from_dist(dist_type="quantile", vpreds_or_logits=values, taus_or_atoms=taus, risk_level=risk_level)
-                    values = values * response_mask
-                    values_mean = values
-            else:
-                if self.quantile_mode == "c51":
-                    atoms = torch.linspace(self.c51_v_min, self.c51_v_max, values.size(-1), device=values.device, dtype=values.dtype)
-                    probs = torch.softmax(values, dim=-1)
-                    expect = (probs * atoms.view(1, 1, -1)).sum(dim=-1)
-                    values = expect * response_mask
-                    values_mean = values
-                else:
-                    values = values * response_mask.unsqueeze(-1)
-                    values_mean = values.mean(dim=-1)
+                    values_risk = compute_rho_from_dist(dist_type="quantile", vpreds_or_logits=values, taus_or_atoms=taus, risk_level=risk_level)
+                values_risk = values_risk * response_mask
         else:
-            values = values * response_mask
-            values_mean = values
+            values_mean = values * response_mask
 
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
-            assert len(indices) == values.size(0), f"{len(indices)} vs. {values.size()}"
+            assert len(indices) == values_mean.size(0), f"{len(indices)} vs. {values_mean.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
-            values = values[revert_indices]
             values_mean = values_mean[revert_indices]
+            if values_risk is not None:
+                values_risk = values_risk[revert_indices]
 
-        return values_mean
+        return values_mean, values_risk
 
     @GPUMemoryLogger(role="dp critic", logger=logger)
     def update_critic(self, data: DataProto):

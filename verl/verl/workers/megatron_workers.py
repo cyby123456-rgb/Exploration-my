@@ -632,7 +632,14 @@ class CriticWorker(MegatronWorker):
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.critic_module)
         values = self.critic.compute_values(data=data)
-        output = DataProto.from_dict(tensors={"values": values})
+        if isinstance(values, (tuple, list)):
+            values_mean, values_risk = values
+        else:
+            values_mean, values_risk = values, None
+        tensors = {"values": values_mean}
+        if values_risk is not None:
+            tensors["values_risk"] = values_risk
+        output = DataProto.from_dict(tensors=tensors)
         output = output.to("cpu")
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.critic_module)

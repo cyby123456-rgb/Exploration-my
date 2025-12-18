@@ -222,6 +222,8 @@ algorithm:
     horizon: 10000
     target_kl: 0.1
   risk_apply_to: "none" # "none" | "baseline" | "target"
+  risk_mix_weight: 0.0 # weight for mixing risk-target return (0=off, 1=only risk)
+  risk_mix_weight: 0
 
 trainer:
   balance_batch: True

@@ -1072,7 +1072,14 @@ class CriticWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             values = self.critic.compute_values(data=data)
-            output = DataProto.from_dict(tensors={"values": values})
+            if isinstance(values, (tuple, list)):
+                values_mean, values_risk = values
+            else:
+                values_mean, values_risk = values, None
+            tensors = {"values": values_mean}
+            if values_risk is not None:
+                tensors["values_risk"] = values_risk
+            output = DataProto.from_dict(tensors=tensors)
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
         output = output.to("cpu")
