@@ -18,20 +18,17 @@ The main entry point to run the PPO algorithm
 import logging
 import os
 import warnings
-from contextlib import contextmanager
 from typing import Union
 
 import psutil
 import torch
 import torch.distributed
-from contextlib import contextmanager
 from codetiming import Timer
 from omegaconf import DictConfig, open_dict
 from torch.distributed.device_mesh import init_device_mesh
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.models.transformers.noise_injection import register_hidden_state_noise, _get_decoder_layers
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils import hf_processor, hf_tokenizer
@@ -56,8 +53,6 @@ from verl.utils.fsdp_utils import (
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import C51ValueHead, IQNValueHead, QRValueHead, compute_position_id_with_mask
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
-
-import random
 
 
 logger = logging.getLogger(__file__)
@@ -219,16 +214,6 @@ class ActorRolloutRefWorker(Worker):
                 attn_implementation="flash_attention_2",
                 trust_remote_code=trust_remote_code,
             )
-            #add noise
-            if role =="actor":
-                register_hidden_state_noise(
-                    model=actor_module,
-                    std=getattr(actor_module.config, "hidden_noise_std", 0.0),
-                    layer_idx=getattr(actor_module.config, "hidden_noise_layer_idx", None),
-                    apply_phase=getattr(actor_module.config, "hidden_noise_phase", "train"),
-                    train_only=getattr(actor_module.config, "hidden_noise_train_only", None),
-                )
-
             if use_remove_padding or self.ulysses_sequence_parallel_size > 1:
                 from verl.models.transformers.monkey_patch import apply_monkey_patch
 
@@ -610,23 +595,20 @@ class ActorRolloutRefWorker(Worker):
             "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
-        #add noise
-        validation_noise_cfg = prompts.meta_info.get("validation_noise")
         is_validate = prompts.meta_info.get("validate", False)
         with self.rollout_sharding_manager:
             log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
 
-            with self._apply_validation_noise_if_needed(validation_noise_cfg, is_validate):
-                if self.config.rollout.name == "sglang_async":
-                    from verl.workers.rollout.sglang_rollout import AsyncSGLangRollout
-                    if isinstance(self.rollout, AsyncSGLangRollout) and hasattr(self.rollout, "_tool_schemas") and len(self.rollout._tool_schemas) > 0:
-                        output = self.rollout.generate_sequences_with_tools(prompts=prompts)
-                    else:
-                        output = self.rollout.generate_sequences(prompts=prompts)
+            if self.config.rollout.name == "sglang_async":
+                from verl.workers.rollout.sglang_rollout import AsyncSGLangRollout
+                if isinstance(self.rollout, AsyncSGLangRollout) and hasattr(self.rollout, "_tool_schemas") and len(self.rollout._tool_schemas) > 0:
+                    output = self.rollout.generate_sequences_with_tools(prompts=prompts)
                 else:
                     output = self.rollout.generate_sequences(prompts=prompts)
+            else:
+                output = self.rollout.generate_sequences(prompts=prompts)
             log_gpu_memory_usage("After rollout generation", logger=logger)
 
             output = self.rollout_sharding_manager.postprocess_data(output)
@@ -636,104 +618,6 @@ class ActorRolloutRefWorker(Worker):
         # clear kv cache
         torch.cuda.empty_cache()
         return output
-    #add noise
-    @contextmanager
-    def _apply_validation_noise_if_needed(self, noise_cfg, is_validate):
-        """Temporarily inject hidden-state noise for validation rollouts."""
-        if not (is_validate and noise_cfg):
-            yield
-            return
-        if self.config.rollout.name != "vllm":
-            yield
-            return
-        model_runner = getattr(self.rollout_sharding_manager, "model_runner", None)
-        model = getattr(model_runner, "model", None) if model_runner is not None else None
-        if model is None:
-            yield
-            return
-
-        # Parse config with safeguards (CLI may provide strings).
-        std = noise_cfg.get("std", 0.0)
-        layer_idx = noise_cfg.get("layer_idx")
-        all_layers_raw = noise_cfg.get("all_layers", False)
-        if isinstance(all_layers_raw, str):
-            all_layers = all_layers_raw.lower() not in ("false", "0", "no", "n", "null", "none", "")
-        else:
-            all_layers = bool(all_layers_raw)
-        fraction = noise_cfg.get("layer_fraction", None)
-        seed = noise_cfg.get("layer_seed", None)
-        decay_cfg = noise_cfg.get("decay", {}) or {}
-        global_step = noise_cfg.get("global_step", None)
-
-        try:
-            std = float(std)
-        except (TypeError, ValueError):
-            std = 0.0
-
-        if isinstance(layer_idx, str):
-            layer_idx = None if layer_idx.lower() == "null" else layer_idx
-        if layer_idx is not None:
-            try:
-                layer_idx = int(layer_idx)
-            except (TypeError, ValueError):
-                layer_idx = None
-
-        # Linear decay: std_eff = max(min_std, std * (1 - step/decay_steps)).
-        std_eff = std
-        decay_steps = decay_cfg.get("steps", None)
-        min_std = decay_cfg.get("min_std", 0.0)
-        try:
-            min_std = float(min_std)
-        except (TypeError, ValueError):
-            min_std = 0.0
-        if decay_steps not in (None, "null"):
-            try:
-                decay_steps_val = float(decay_steps)
-            except (TypeError, ValueError):
-                decay_steps_val = None
-            if decay_steps_val is not None and decay_steps_val > 0 and global_step is not None:
-                try:
-                    step_val = float(global_step)
-                except (TypeError, ValueError):
-                    step_val = None
-                if step_val is not None:
-                    ratio = max(0.0, 1.0 - step_val / decay_steps_val)
-                    std_eff = max(min_std, std * ratio)
-        
-        try:
-            fraction = None if fraction in (None, "null") else float(fraction)
-        except (TypeError, ValueError):
-            fraction = None
-
-        if fraction is not None and fraction > 0:
-            try:
-                layers = _get_decoder_layers(model)
-                num_layers = len(layers)
-                k = max(1, int(num_layers * fraction))
-                rng = random.Random(seed)
-                layer_idx = sorted(rng.sample(range(num_layers), k))
-            except Exception:
-                pass  # 回退到已有的 layer_idx
-
-        handles = register_hidden_state_noise(
-            model=model,
-            std=std_eff,
-            layer_idx=layer_idx,
-            apply_phase="eval",
-            all_layers=bool(all_layers),
-        )
-        try:
-            yield
-        finally:
-            if handles is not None:
-                if isinstance(handles, (list, tuple)):
-                    for h in handles:
-                        if hasattr(h, "remove"):
-                            h.remove()
-                else:
-                    if hasattr(handles, "remove"):
-                        handles.remove()
-
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor

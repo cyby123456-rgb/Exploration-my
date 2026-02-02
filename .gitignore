@@ -123,3 +123,6 @@ logs
 log
 outputs
 *.zip
+
+evaluation/qwen2.5-1.5b-2gpu-PPO-eval
+evaluation/results

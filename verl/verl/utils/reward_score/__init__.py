@@ -62,6 +62,10 @@ def _default_compute_score(data_source, solution_str, ground_truth, extra_info=N
             ground_truth=ground_truth,
             extra_info=extra_info,
         )
+    elif data_source in ["countdown"]:
+        from . import countdown
+
+        res = countdown.compute_score(solution_str, ground_truth)
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 

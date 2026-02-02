@@ -26,7 +26,7 @@ actor_rollout_ref:
   model:
     path: ~/models/deepseek-llm-7b-chat
     external_lib: null
-    override_config: {hidden_noise_std:0.0, hidden_noise_layer_idx:null,hidden_noise_phase:train}
+    override_config: {}
     enable_gradient_checkpointing: True
     use_remove_padding: False
     use_liger: False
@@ -146,7 +146,7 @@ critic:
   sr_lambda: 0.9
   sr_num_samples: 8
   use_action_response_mask: False
-  risk_apply_to: "none" # "none" | "baseline" | "target" | "target1" | "baseline1" | "gae_rho"
+  risk_apply_to: "none" # "none" | "baseline1"
   risk_level: "neutral" # "neutral" | "averse" | "seeking" | "cvar_lower_0.1" | "cvar_upper_0.1"
   optim:
     lr: 1e-5
@@ -227,12 +227,11 @@ algorithm:
     kl_coef: 0.001
     horizon: 10000
     target_kl: 0.1
-  risk_apply_to: "none" # "none" | "baseline" | "target" | "target1" | "baseline1" | "gae_rho"
+  risk_apply_to: "none" # "none" | "baseline1"
   risk_level: "neutral" # "neutral" | "averse" | "seeking" | "cvar_lower_α" | "cvar_upper_α"
   # baseline / advantage shaping options for risk-sensitive PPO
-  # only used when risk_apply_to is "target1" | "baseline1" | "gae_rho"
-  baseline_mode: "no_baseline"    # "no_baseline" | "neutral" | "risk" | "mix" | "reweight"
-  baseline_mix_beta: 0.5   # mixing coefficient when baseline_mode == "mix"
+  # only used when risk_apply_to is "baseline1"
+  baseline_mode: "neutral"    # "neutral" | "risk" | "reweight"
 
 trainer:
   balance_batch: True
@@ -252,16 +251,6 @@ trainer:
   resume_from_path: null
   val_before_train: True
   test_freq: -1
-  #add noise
-  validation_noise:
-    std: 0.0
-    layer_idx: null
-    all_layers: false
-    layer_fraction: null
-    layer_seed: null
-    decay:
-      steps: null   # linear decay steps; null disables decay
-      min_std: 0.0  # lower bound after decay
   critic_warmup: 0
   default_hdfs_dir: null
   del_local_ckpt_after_load: False

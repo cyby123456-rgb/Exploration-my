@@ -199,8 +199,7 @@ def compute_advantage(
     multi_turn: bool = False,
     norm_adv_by_std_in_grpo: bool = True,
     risk_apply_to: str = "none",
-    baseline_mode: str = "no_baseline",
-    baseline_mix_beta: float = 0.5,
+    baseline_mode: str = "neutral",
     risk_level: str = "neutral",
 ):
     # Back-compatible with trainers that do not compute response mask in fit
@@ -208,53 +207,11 @@ def compute_advantage(
         data.batch["response_mask"] = compute_response_mask(data)
     response_mask = data.batch["response_mask"]
 
-    # === legacy target 模式（保持向后兼容，不改内部实现）===
-    # 注意：该分支会用 critic 的 values 直接覆盖 returns，存在“risk-of-risk”自闭环问题。
-    # 为兼容旧实验，仅在 risk_apply_to == "target" 时保留原行为。
-    if risk_apply_to == "target":
-        # Risk-sensitive target mode: optimize E[rho(Z)] directly.
-        # Critic returns rho(Z) in "values".
-        # We take rho(Z) at the last step (or aggregating) and define it as the return.
-        # Simplified version: returns = rho(Z_last) broadcasted.
-        rho = data.batch["values"]  # (B, T)
-
-        # Take the value at the last valid token of response? 
-        # Actually values is already masked by response_mask in critic?
-        # In dp_critic: values = values * response_mask
-        # So invalid steps are 0.
-        # But we want the value at the *end* of the episode (or end of response).
-
-        # We can sum values / sum(mask) ? No, that's average risk over path.
-        # Usually risk is defined on the Return Z.
-        # Critic estimates rho(Z_t).
-        # rho(Z_0) is the risk of the whole trajectory.
-        # But PPO updates policy at all steps.
-        # Should we use rho(Z_t) as target for step t?
-        # "returns = rho_seq" in prompt implies using the risk value as the return.
-
-        # Prompt: "rho_seq = rho(Z(s_last)) ... returns = rho_seq.unsqueeze(-1)..."
-        # So we take the LAST value.
-
-        # rho is (B, T). We want (B,) from the last step.
-        # How to find last step efficiently? argmax over mask?
-        # Actually simplest is just take the last element if we know it corresponds to EOS?
-        # But padding...
-        # response_mask has 1s then 0s.
-        # Last valid index: response_mask.sum(1) - 1.
-
-        last_indices = response_mask.sum(1).long() - 1
-        last_indices = last_indices.clamp(min=0) # handle empty?
-
-        # gather
-        # rho: (B, T)
-        rho_last = rho.gather(1, last_indices.unsqueeze(1)).squeeze(1) # (B,)
-
-        returns = rho_last.unsqueeze(1).expand_as(response_mask) * response_mask
-        advantages = returns # REINFORCE-like with risk return
-
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
-        return data
+    if risk_apply_to in {"target", "baseline", "gae_rho", "target1"}:
+        raise ValueError(
+            "algorithm.risk_apply_to no longer supports "
+            "'target', 'baseline', 'gae_rho', or 'target1'."
+        )
 
     # === Step 1：先按标准 PPO 方式计算基础 advantages / returns（不带新的 risk 逻辑）===
     if adv_estimator == AdvantageEstimator.PASSKTRAINING:
@@ -344,7 +301,7 @@ def compute_advantage(
         return data
 
     # === Step 2b：如果没有风险需求，直接返回 ===
-    if risk_apply_to not in ["baseline1", "target1", "gae_rho"]:
+    if risk_apply_to not in ["baseline1"]:
         return data
 
     # === Step 2c：从 Critic 输出中恢复分布，计算 rho(Z)（如果可用） ===
@@ -392,12 +349,9 @@ def compute_advantage(
 
     rho = rho * response_mask  # 仅作用在 response 区间
 
-    # baseline 组合：neutral / risk / mix
+    # baseline 组合：neutral / risk
     #只修改传给GAE的baseline是什么
-    def _build_baseline(target_like: torch.Tensor) -> torch.Tensor:
-        if baseline_mode == "no_baseline":
-            return torch.zeros_like(target_like)
-
+    def _build_baseline() -> torch.Tensor:
         b_neutral = values_neutral * response_mask
         b_risk = rho
 
@@ -405,9 +359,6 @@ def compute_advantage(
             return b_neutral
         if baseline_mode == "risk":
             return b_risk
-        if baseline_mode == "mix":
-            beta = baseline_mix_beta
-            return beta * b_neutral + (1.0 - beta) * b_risk
         raise ValueError(f"Unknown baseline_mode: {baseline_mode}")
 
     def _record_masked_stats(name_prefix: str, tensor: torch.Tensor) -> None:
@@ -421,42 +372,6 @@ def compute_advantage(
         adv_metrics[f"{name_prefix}_std"] = float(std.detach().item())
         adv_metrics[f"{name_prefix}_min"] = float(masked.min().detach().item())
         adv_metrics[f"{name_prefix}_max"] = float(masked.max().detach().item())
-
-    if risk_apply_to == "gae_rho":
-        if not has_distributional_info:
-            raise ValueError(
-                "algorithm.risk_apply_to=gae_rho requires a distributional critic output "
-                "(value_logits/value_atoms or value_quantiles). "
-                "Please enable critic.distributional or switch risk_apply_to away from gae_rho."
-            )
-
-        if baseline_mode == "neutral":
-            values_for_gae = values_neutral * response_mask
-        elif baseline_mode == "risk":
-            values_for_gae = rho * response_mask
-        elif baseline_mode == "mix":
-            beta = baseline_mix_beta
-            values_for_gae = (beta * values_neutral + (1.0 - beta) * rho) * response_mask
-        elif baseline_mode == "no_baseline":
-            values_for_gae = torch.zeros_like(values_neutral)
-        elif baseline_mode == "reweight":
-            raise ValueError(
-                "baseline_mode=reweight is not supported for risk_apply_to=gae_rho. "
-                "Use no_baseline/neutral/risk/mix instead."
-            )
-        else:
-            raise ValueError(f"Unknown baseline_mode: {baseline_mode}")
-
-        adv_rho, _ = core_algos.compute_gae_advantage_return(
-            token_level_rewards=data.batch["token_level_rewards"],
-            values=values_for_gae,
-            response_mask=response_mask,
-            gamma=gamma,
-            lam=lam,
-        )
-        data.batch["advantages"] = adv_rho
-        _record_masked_stats("adv/actor_values_for_gae", values_for_gae)
-        return data
 
     # baseline1: 只修改 advantage 的 baseline / 权重，不影响 GAE TD 递推（returns 保持不变）
     if risk_apply_to == "baseline1":
@@ -560,34 +475,11 @@ def compute_advantage(
             _record_masked_stats("adv/weights", w)
             return data
 
-        # 其它 baseline_mode 沿用 risk-neutral / risk / mix baseline
-        b = _build_baseline(G)
+        # 其它 baseline_mode 沿用 risk-neutral / risk baseline
+        b = _build_baseline()
         raw_adv = (G - b) * response_mask
         reshaped_adv = masked_whiten(raw_adv, response_mask)
         data.batch["advantages"] = reshaped_adv
-        return data
-
-    # target1: 使用 rho(Z) 构造风险目标 G_risk，仅作用在 actor 的 advantage
-    if risk_apply_to == "target1":
-        if not has_distributional_info:
-            raise ValueError(
-                "algorithm.risk_apply_to=target1 requires a distributional critic output "
-                "(value_logits/value_atoms or value_quantiles). "
-                "Please enable critic.distributional or switch risk_apply_to away from target1."
-            )
-        # 复用 legacy target 的“末 token 取值”作为 G_risk
-        #将最后一个位置的风险值广播到整个序列，因为最后一步包含了完整的风险信息
-        last_indices = response_mask.sum(1).long() - 1
-        last_indices = last_indices.clamp(min=0)
-        rho_last = rho.gather(1, last_indices.unsqueeze(1)).squeeze(1)  # (B,)
-        risk_returns = rho_last.unsqueeze(1).expand_as(response_mask) * response_mask
-
-        b = _build_baseline(risk_returns)
-        raw_adv = (risk_returns - b) * response_mask
-        reshaped_adv = masked_whiten(raw_adv, response_mask)
-
-        data.batch["advantages"] = reshaped_adv
-        _record_masked_stats("adv/risk_returns", risk_returns)
         return data
 
     return data
@@ -668,18 +560,6 @@ class RayPPOTrainer:
         self.use_rm = Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
         self.validation_generations_logger = ValidationGenerationsLogger()
-        #add noise
-        self.validation_noise_cfg = None
-        trainer_noise_cfg = OmegaConf.select(self.config, "trainer.validation_noise")
-        if trainer_noise_cfg is not None:
-            trainer_noise_cfg = OmegaConf.to_container(trainer_noise_cfg, resolve=True)
-            std = trainer_noise_cfg.get("std", 0.0)
-            try:
-                std_value = float(std)
-            except (TypeError, ValueError):
-                std_value = 0.0
-            if std_value > 0:
-                self.validation_noise_cfg = copy.deepcopy(trainer_noise_cfg)
         # define in-reward KL control
         # kl loss control currently not suppoorted
         if config.algorithm.use_kl_in_reward:
@@ -982,11 +862,6 @@ class RayPPOTrainer:
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
             }
-            #add noise
-            if self.validation_noise_cfg is not None:
-                noise_cfg = copy.deepcopy(self.validation_noise_cfg)
-                noise_cfg["global_step"] = self.global_steps
-                test_gen_batch.meta_info["validation_noise"] = noise_cfg
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
@@ -1645,8 +1520,7 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                             risk_apply_to=self.config.algorithm.get("risk_apply_to", "none"),
-                            baseline_mode=self.config.algorithm.get("baseline_mode", "no_baseline"),
-                            baseline_mix_beta=self.config.algorithm.get("baseline_mix_beta", 0.5),
+                            baseline_mode=self.config.algorithm.get("baseline_mode", "neutral"),
                             risk_level=self.config.algorithm.get("risk_level", "neutral"),
                         ) # type: ignore
                         metrics.update(batch.meta_info.get("adv_metrics", {}))
