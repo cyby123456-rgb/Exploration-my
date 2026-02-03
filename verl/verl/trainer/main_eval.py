@@ -28,7 +28,7 @@ from tqdm import tqdm
 
 from verl.utils.fs import copy_to_local
 from verl.trainer.main_ppo import _select_rm_score_fn
-
+from omegaconf import OmegaConf
 
 def get_custom_reward_fn(config):
     import importlib.util
@@ -65,6 +65,61 @@ def get_custom_reward_fn(config):
 
     return wrapped_fn
 
+def log_metrics_if_configured(config, metric_dict):
+    tracking_cfg = config.get("tracking") or {}
+    logger_backends = tracking_cfg.get("logger") or []
+    if not logger_backends:
+        return None
+
+    from verl.utils.tracking import Tracking
+
+    project_name = tracking_cfg.get("project_name") or "verl-eval"
+    experiment_name = tracking_cfg.get("experiment_name") or "main_eval"
+    logger = Tracking(
+        project_name=project_name,
+        experiment_name=experiment_name,
+        default_backend=logger_backends,
+        config=OmegaConf.to_container(config, resolve=True),
+    )
+    logger.log(data=metric_dict, step=0)
+    return logger
+
+
+def log_wandb_summary_table(logger, data_source_reward, data_source_avg32, data_source_passk):
+    if logger is None or "wandb" not in logger.logger:
+        return
+
+    max_k = 0
+    for passk_lists in data_source_passk.values():
+        for lst in passk_lists:
+            if len(lst) > max_k:
+                max_k = len(lst)
+
+    columns = ["data_source", "test_score", "test_avg@32"]
+    columns.extend([f"pass@{k}" for k in range(1, max_k + 1)])
+
+    rows = []
+    for data_source in sorted(data_source_reward.keys()):
+        rewards = data_source_reward.get(data_source, [])
+        avg32_list = data_source_avg32.get(data_source, [])
+        passk_lists = data_source_passk.get(data_source, [])
+
+        row = [
+            data_source,
+            float(np.mean(rewards)) if rewards else None,
+            float(np.mean(avg32_list)) if avg32_list else None,
+        ]
+
+        for idx in range(max_k):
+            vals = [lst[idx] for lst in passk_lists if len(lst) > idx]
+            row.append(float(np.mean(vals)) if vals else None)
+
+        rows.append(row)
+
+    import wandb
+
+    table = wandb.Table(columns=columns, data=rows)
+    wandb.log({"eval/summary_table": table}, step=0)
 
 @ray.remote
 def process_item(reward_fn, data_source, response_lst, reward_data):
@@ -72,12 +127,13 @@ def process_item(reward_fn, data_source, response_lst, reward_data):
     if reward_fn is None:
         compute_score_fn = _select_rm_score_fn(data_source)
         score_lst = [compute_score_fn(solution_str=r, ground_truth=ground_truth) for r in response_lst]
+        print(f"score_lst: '{score_lst}'")
     else:
         score_lst = [reward_fn(data_source, r, ground_truth) for r in response_lst]
     n = len(score_lst)
     c = int(np.sum(np.array(score_lst) > 0))
     passk_lst = []
-    for k in range(1, n + 1):
+    for k in range(1, n+1):
         if c == 0:
             passk = 0.0
         elif n - c < k:
@@ -137,8 +193,10 @@ def main(config):
             vals = [lst[idx] for lst in passk_lists if len(lst) > idx]
             if vals:
                 metric_dict[f"test_pass@{idx + 1}/{data_source}"] = float(np.mean(vals))
-
+    log_metrics_if_configured(config, metric_dict)
     print(metric_dict)
+
+
 
 
 if __name__ == "__main__":
